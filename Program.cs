@@ -15,44 +15,69 @@ using Microsoft.VisualBasic;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.OAuth;
 using Microsoft.VisualStudio.Services.WebApi;
+using Mono.Options;
 
 const string AzdoOrganizationUrl = $"https://dev.azure.com/dnceng-public";
 const string AzdoProjectName = "public";
 
 try
 {
-    int prNumber;
-    if (args.Length == 0)
+    int prNumber = 0;
+    bool detailed = false;
+    string? phaseNameFilter = null;
+
+    var options = new OptionSet
+    {
+        { "pr=", "The PR value (required)", (int v) => prNumber = v },
+        { "phase=", "Filter to a phase", (string p) => phaseNameFilter = p },
+        { "detailed", "Enable detailed mode", v => detailed = v != null }
+    };
+
+    var extra = options.Parse(args);
+    if (extra.Count > 0)
+    {
+        throw new OptionException("Unrecognized option: " + extra[0], extra[0]);
+    }
+
+    if (prNumber == 0)
     {
         prNumber = 76828;
         Console.WriteLine($"No PR number specified, using {prNumber}");
     }
-    else
-    {
-        prNumber = int.Parse(args[0]);
-    }
 
     var credential = new AzureCliCredential(
         new AzureCliCredentialOptions { TenantId = "72f988bf-86f1-41af-91ab-2d7cd011db47" });
-    var (azdoBuildId, workItemResults) = await GetHelixWorkItemResults(credential, prNumber);
+    var allWorkItemResults = await GetAllHelixWorkItemResults(credential, prNumber);
     var azdoConnection = await GetAzdoConnection(credential);
     var buildClient = azdoConnection.GetClient<BuildHttpClient>();
     var httpClient = new HttpClient();
-    var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
-
-    foreach (var g in workItemResults.GroupBy(x => x.AzdoPhaseName))
+    foreach (var (azdoBuildId, workItemResults) in GetByBuild(allWorkItemResults))
     {
-        var attemptId = g.Max(x => x.AzdoAttempt);
-        var phaseWorkItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
         try
         {
-            await ComparePhase(
-                httpClient,
-                azdoBuildId,
-                g.Key,
-                attemptId,
-                g.ToList(),
-                buildArtifacts);
+            var url = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={azdoBuildId}";
+            Console.WriteLine();
+            Console.WriteLine(url);
+
+            var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
+            foreach (var g in workItemResults.GroupBy(x => x.AzdoPhaseName))
+            {
+                if (phaseNameFilter is not null && g.Key != phaseNameFilter)
+                {
+                    continue;
+                }
+
+                var attemptId = g.Max(x => x.AzdoAttempt);
+                var phaseWorkItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
+                await ComparePhase(
+                    httpClient,
+                    azdoBuildId,
+                    g.Key,
+                    attemptId,
+                    g.ToList(),
+                    buildArtifacts,
+                    detailed);
+            }
         }
         catch (Exception ex)
         {
@@ -67,9 +92,8 @@ catch (Exception ex)
     Console.WriteLine(ex.StackTrace);
 }
 
-async Task<(int AzdoBuildId, List<WorkItemResult>)> GetHelixWorkItemResults(TokenCredential credential, int prNumber)
+IEnumerable<(int AzdoBuildId, List<WorkItemResult>)> GetByBuild(List<WorkItemResult> workItemResults)
 {
-    var workItemResults = await GetAllHelixWorkItemResults(credential, prNumber);
     var buildIds = workItemResults
         .Select(x => x.AzdoBuildId)
         .Distinct()
@@ -77,29 +101,13 @@ async Task<(int AzdoBuildId, List<WorkItemResult>)> GetHelixWorkItemResults(Toke
         .ToList();
     if (buildIds.Count == 1)
     {
-        return (buildIds[0], workItemResults);
+        yield return (buildIds[0], workItemResults);
+        yield break;
     }
 
-    while (true)
+    foreach (var buildId in buildIds)
     {
-        Console.WriteLine($"PR has multiple builds, which build do you want to analyze?");
-        for (var i = 0; i < buildIds.Count; i++)
-        {
-            var id = buildIds[i];
-            var url = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={id}";
-            Console.WriteLine($"{i + 1}. {id} - {url}");
-        }
-        var input = Console.ReadLine();
-
-        if (int.TryParse(input, out var choice) && choice >= 1 && choice <= buildIds.Count)
-        {
-            var id = buildIds[choice - 1];
-            return (id, workItemResults.Where(x => x.AzdoBuildId == id).ToList());
-        }
-        else
-        {
-            Console.WriteLine("Invalid input, try again.");
-        }
+        yield return (buildId, workItemResults.Where(x => x.AzdoBuildId == buildId).ToList());
     }
 }
 
@@ -145,7 +153,6 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
             var friendlyName = reader.GetString(0);
             if (!Regex.IsMatch(friendlyName, @"workitem_\d+"))
             {
-                Console.WriteLine($"Skipping helix work item {friendlyName}");
                 continue;
             }
 
@@ -174,7 +181,8 @@ async Task ComparePhase(
     string phaseName,
     int attemptId,
     List<WorkItemResult> helixResults,
-    List<BuildArtifact> buildArtifacts)
+    List<BuildArtifact> buildArtifacts,
+    bool detailed)
 {
     Debug.Assert(helixResults.All(x => x.AzdoPhaseName == phaseName));
     var azdoDataList = await GetAzdoWorkItemData(
@@ -185,26 +193,28 @@ async Task ComparePhase(
         buildArtifacts);
 
     Console.WriteLine($"Comparing {phaseName}");
-    foreach (var data in azdoDataList)
+    if (detailed)
     {
-        var helixResult = helixResults.SingleOrDefault(x => x.FriendlyName == data.Name);
-        if (helixResult is null)
+        foreach (var data in azdoDataList)
         {
-            Console.WriteLine($"\t{data.Name} missing helix work item");
-            continue;
-        }
+            var helixResult = helixResults.SingleOrDefault(x => x.FriendlyName == data.Name);
+            if (helixResult is null)
+            {
+                Console.WriteLine($"\t{data.Name} missing helix work item");
+                continue;
+            }
 
-        if (data.ExpectedExecutionTime is null)
-        {
-            Console.WriteLine($"\t{data.Name} missing azdo execution time");
-        }
+            if (data.ExpectedExecutionTime is null)
+            {
+                Console.WriteLine($"\t{data.Name} missing azdo execution time");
+            }
 
-        var diff = helixResult.ExecutionTime - data.ExpectedExecutionTime;
-        Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss}");
+            var diff = helixResult.ExecutionTime - data.ExpectedExecutionTime;
+            Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss}");
+        }
     }
-
-    Console.WriteLine($"\tTotal Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
-    Console.WriteLine($"\tTotal Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
 }
 
 async Task<VssConnection> GetAzdoConnection(TokenCredential credential)
