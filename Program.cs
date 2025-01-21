@@ -60,6 +60,7 @@ try
             Console.WriteLine(url);
 
             var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
+            var timeline = await buildClient.GetBuildTimelineAsync(AzdoProjectName, azdoBuildId);
             foreach (var g in workItemResults.GroupBy(x => x.AzdoPhaseName))
             {
                 if (phaseNameFilter is not null && g.Key != phaseNameFilter)
@@ -76,6 +77,7 @@ try
                     attemptId,
                     g.ToList(),
                     buildArtifacts,
+                    timeline,
                     detailed);
             }
         }
@@ -182,6 +184,7 @@ async Task ComparePhase(
     int attemptId,
     List<WorkItemResult> helixResults,
     List<BuildArtifact> buildArtifacts,
+    Timeline timeline,
     bool detailed)
 {
     Debug.Assert(helixResults.All(x => x.AzdoPhaseName == phaseName));
@@ -215,6 +218,26 @@ async Task ComparePhase(
     }
     Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
     Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
+    var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
+    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:mm\\:ss}");
+}
+
+TimeSpan? GetAzdoPhaseExecutionTime(
+    Timeline? timeline,
+    string phaseName)
+{
+    if (timeline is null)
+    {
+        return null;
+    }
+
+    var record = timeline.Records.Where(x => x.Name ==  phaseName && x.RecordType == "Phase").FirstOrDefault();;
+    if (record is null)
+    {
+        return null;
+    }
+
+    return record.FinishTime - record.StartTime;
 }
 
 async Task<VssConnection> GetAzdoConnection(TokenCredential credential)
