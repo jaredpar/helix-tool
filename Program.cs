@@ -207,15 +207,11 @@ async Task ComparePhase(
                 continue;
             }
 
-            if (data.ExpectedExecutionTime is null)
-            {
-                Console.WriteLine($"\t{data.Name} missing azdo execution time");
-            }
-
             var diff = helixResult.ExecutionTime - data.ExpectedExecutionTime;
             Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss}");
         }
     }
+    Console.WriteLine($"\tTotal Estimated Time: {azdoDataList.Sum(x => x.ExpectedExecutionTime):mm\\:ss}");
     Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
     Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
     var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
@@ -267,16 +263,20 @@ async Task<List<WorkItemData>> GetAzdoWorkItemData(
         .Select(e => 
         {
             var expectedStr = e.Element("ExpectedExecutionTime")?.Value;
-            var t = string.IsNullOrEmpty(expectedStr) ? (TimeSpan?)null : TimeSpan.Parse(expectedStr);
-            return new WorkItemData(e.Attribute("Include")!.Value, t);
+            if (string.IsNullOrEmpty(expectedStr))
+            {
+                throw new Exception($"ExpectedExecutionTime missing for {e.Attribute("Include")!.Value}");
+            }
+
+            return new WorkItemData(e.Attribute("Include")!.Value, TimeSpan.Parse(expectedStr));
         })
         .ToList();
 }
 
-internal sealed class WorkItemData(string name, TimeSpan? expectedExecutionTime)
+internal sealed class WorkItemData(string name, TimeSpan expectedExecutionTime)
 {
     public string Name { get; } = name;
-    public TimeSpan? ExpectedExecutionTime { get; } = expectedExecutionTime;
+    public TimeSpan ExpectedExecutionTime { get; } = expectedExecutionTime;
 
     public override string ToString() => $"{Name} ({ExpectedExecutionTime})";
 }
