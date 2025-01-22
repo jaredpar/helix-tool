@@ -215,10 +215,11 @@ async Task ComparePhase(
 
     var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
     var estimatedTime = azdoDataList.Sum(x => x.ExpectedExecutionTime);
-    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:mm\\:ss}");
-    Console.WriteLine($"\tTotal Estimated Time: {estimatedTime:mm\\:ss}");
-    Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
-    Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
+    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:hh\\:mm\\:ss}");
+    Console.WriteLine($"\tTotal Estimated Time: {estimatedTime:hh\\:mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):hh\\:mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):hh\\:mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Work Items: {helixResults.Count}");
     Console.WriteLine($"\tTotal Helix Machines {helixResults.Select(x => x.MachineName).Distinct().Count()}");
     Console.WriteLine($"\tHelix {(estimatedTime < azdoExecutionTime ? "saved" : "lost")} time");
 }
