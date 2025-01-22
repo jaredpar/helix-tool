@@ -143,7 +143,7 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
             | extend AzdoBuildId = toint(p["BuildId"])
             | extend ExecutionTime = (Finished - Started) / 1s
             | extend QueuedTime = (Started - Queued) / 1s
-            | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt
+            | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt, MachineName
             """;
 
         var reader = kustoQueryClient.ExecuteQuery(query);
@@ -163,8 +163,9 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
             var azdoBuildId = reader.GetInt32(3);
             var azdoPhaseName = reader.GetString(4);
             var azdoAttempt = int.Parse(reader.GetString(5));
+            var machineName = reader.GetString(6);
 
-            list.Add(new WorkItemResult(friendlyName, executionTime, queuedTime, azdoAttempt, azdoPhaseName, azdoBuildId));
+            list.Add(new WorkItemResult(friendlyName, executionTime, queuedTime, azdoAttempt, azdoPhaseName, azdoBuildId, machineName));
         }
 
         return list;
@@ -208,14 +209,18 @@ async Task ComparePhase(
             }
 
             var diff = helixResult.ExecutionTime - data.ExpectedExecutionTime;
-            Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss}");
+            Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss} machine: {helixResult.MachineName}");
         }
     }
-    Console.WriteLine($"\tTotal Estimated Time: {azdoDataList.Sum(x => x.ExpectedExecutionTime):mm\\:ss}");
+
+    var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
+    var estimatedTime = azdoDataList.Sum(x => x.ExpectedExecutionTime);
+    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:mm\\:ss}");
+    Console.WriteLine($"\tTotal Estimated Time: {estimatedTime:mm\\:ss}");
     Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):mm\\:ss}");
     Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):mm\\:ss}");
-    var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
-    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:mm\\:ss}");
+    Console.WriteLine($"\tTotal Helix Machines {helixResults.Select(x => x.MachineName).Distinct().Count()}");
+    Console.WriteLine($"\tHelix {(estimatedTime < azdoExecutionTime ? "saved" : "lost")} time");
 }
 
 TimeSpan? GetAzdoPhaseExecutionTime(
@@ -287,7 +292,8 @@ internal sealed class WorkItemResult(
     TimeSpan queuedTime,
     int azdoAttempt,
     string azdoPhaseName,
-    int azdoBuildId)
+    int azdoBuildId,
+    string machineName)
 {
     public string FriendlyName { get; } = friendlyName;
     public TimeSpan ExecutionTime { get; } = executionTime;
@@ -295,6 +301,7 @@ internal sealed class WorkItemResult(
     public int AzdoAttempt { get; } = azdoAttempt;
     public string AzdoPhaseName { get; } = azdoPhaseName;
     public int AzdoBuildId { get; } = azdoBuildId;
+    public string MachineName { get; } = machineName;
 
     public override string ToString() => $"{FriendlyName} ({AzdoBuildId})";
 }
