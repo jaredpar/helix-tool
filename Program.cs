@@ -55,31 +55,7 @@ try
     {
         try
         {
-            var url = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={azdoBuildId}";
-            Console.WriteLine();
-            Console.WriteLine(url);
-
-            var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
-            var timeline = await buildClient.GetBuildTimelineAsync(AzdoProjectName, azdoBuildId);
-            foreach (var g in workItemResults.GroupBy(x => x.AzdoPhaseName))
-            {
-                if (phaseNameFilter is not null && g.Key != phaseNameFilter)
-                {
-                    continue;
-                }
-
-                var attemptId = g.Max(x => x.AzdoAttempt);
-                var phaseWorkItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
-                await ComparePhase(
-                    httpClient,
-                    azdoBuildId,
-                    g.Key,
-                    attemptId,
-                    g.ToList(),
-                    buildArtifacts,
-                    timeline,
-                    detailed);
-            }
+            PrintBuildDetails(buildClient, httpClient, azdoBuildId, workItemResults, phaseNameFilter, detailed).Wait();
         }
         catch (Exception ex)
         {
@@ -178,50 +154,87 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
     }
 }
 
-async Task ComparePhase(
+async Task PrintBuildDetails(
+    BuildHttpClient buildClient,
     HttpClient httpClient,
-    int buildId,
-    string phaseName,
-    int attemptId,
-    List<WorkItemResult> helixResults,
-    List<BuildArtifact> buildArtifacts,
-    Timeline timeline,
+    int azdoBuildId,
+    List<WorkItemResult> workItemResults,
+    string? phaseNameFilter,
     bool detailed)
 {
-    Debug.Assert(helixResults.All(x => x.AzdoPhaseName == phaseName));
-    var azdoDataList = await GetAzdoWorkItemData(
-        httpClient,
-        buildId,
-        phaseName,
-        attemptId,
-        buildArtifacts);
+    var url = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={azdoBuildId}";
+    Console.WriteLine(url);
+    Console.WriteLine();
+    Console.WriteLine("|Phase                                      | AzDo     | AzDo Est | Helix Que | Helix QueAvg |Helix Exec | Helix Items | Helix Machines |");
+    Console.WriteLine("|-------------------------------------------|----------|----------|-----------|--------------|-----------|-------------|----------------|");
 
-    Console.WriteLine($"Comparing {phaseName}");
+    var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
+    var timeline = await buildClient.GetBuildTimelineAsync(AzdoProjectName, azdoBuildId);
+    var groupedResults = workItemResults
+        .Where(x => x.AzdoPhaseName != phaseNameFilter)
+        .GroupBy(x => x.AzdoPhaseName);
+
+    foreach (var g in groupedResults)
+    {
+        var attemptId = g.Max(x => x.AzdoAttempt);
+        var phaseWorkItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
+        await PrintBuildPhaseDetails(
+            httpClient,
+            azdoBuildId,
+            g.Key,
+            attemptId,
+            g.ToList(),
+            buildArtifacts,
+            timeline);
+    }
+
+    Console.WriteLine();
+
     if (detailed)
     {
-        foreach (var data in azdoDataList)
+        foreach (var g in groupedResults)
         {
-            var helixResult = helixResults.SingleOrDefault(x => x.FriendlyName == data.Name);
-            if (helixResult is null)
+            Console.WriteLine(g.Key);
+            Console.WriteLine();
+            Console.WriteLine("| Work Item Name | Queued   | Execution | Machine    |");
+            Console.WriteLine("|----------------|----------|-----------|------------|");
+            foreach (var item in g.OrderBy(x => x.MachineName))
             {
-                Console.WriteLine($"\t{data.Name} missing helix work item");
-                continue;
+                Console.WriteLine($"| {item.FriendlyName,-15}| {item.QueuedTime:hh\\:mm\\:ss} | {item.ExecutionTime:hh\\:mm\\:ss}  | {item.MachineName,-11}|");
             }
-
-            var diff = helixResult.ExecutionTime - data.ExpectedExecutionTime;
-            Console.WriteLine($"\t{data.Name} expected: {data.ExpectedExecutionTime:mm\\:ss} actual: {helixResult.ExecutionTime:mm\\:ss} diff: {diff:mm\\:ss} queued: {helixResult.QueuedTime:mm\\:ss} machine: {helixResult.MachineName}");
+            Console.WriteLine();
         }
     }
 
-    var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
-    var estimatedTime = azdoDataList.Sum(x => x.ExpectedExecutionTime);
-    Console.WriteLine($"\tTotal Azdo Execution Time: {azdoExecutionTime:hh\\:mm\\:ss}");
-    Console.WriteLine($"\tTotal Estimated Time: {estimatedTime:hh\\:mm\\:ss}");
-    Console.WriteLine($"\tTotal Helix Queued Time: {helixResults.Sum(x => x.QueuedTime):hh\\:mm\\:ss}");
-    Console.WriteLine($"\tTotal Helix Execution Time: {helixResults.Sum(x => x.ExecutionTime):hh\\:mm\\:ss}");
-    Console.WriteLine($"\tTotal Helix Work Items: {helixResults.Count}");
-    Console.WriteLine($"\tTotal Helix Machines {helixResults.Select(x => x.MachineName).Distinct().Count()}");
-    Console.WriteLine($"\tHelix {(estimatedTime < azdoExecutionTime ? "saved" : "lost")} time");
+    async Task PrintBuildPhaseDetails(
+        HttpClient httpClient,
+        int buildId,
+        string phaseName,
+        int attemptId,
+        List<WorkItemResult> helixResults,
+        List<BuildArtifact> buildArtifacts,
+        Timeline timeline)
+    {
+        Debug.Assert(helixResults.All(x => x.AzdoPhaseName == phaseName));
+        var azdoDataList = await GetAzdoWorkItemData(
+            httpClient,
+            buildId,
+            phaseName,
+            attemptId,
+            buildArtifacts);
+
+        var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
+        var estimatedTime = azdoDataList.Sum(x => x.ExpectedExecutionTime);
+        Console.Write($"| {phaseName,-42}|");
+        Console.Write($" {azdoExecutionTime:hh\\:mm\\:ss} |");
+        Console.Write($" {estimatedTime:hh\\:mm\\:ss} |");
+        Console.Write($" {helixResults.Sum(x => x.QueuedTime):hh\\:mm\\:ss}  |");
+        Console.Write($" {helixResults.Average(x => x.QueuedTime):hh\\:mm\\:ss}     |");
+        Console.Write($" {helixResults.Sum(x => x.ExecutionTime):hh\\:mm\\:ss}  |");
+        Console.Write($" {helixResults.Count,-12}|");
+        Console.Write($" {helixResults.Select(x => x.MachineName).Distinct().Count(),-15}|");
+        Console.WriteLine();
+    }        
 }
 
 TimeSpan? GetAzdoPhaseExecutionTime(
@@ -317,4 +330,13 @@ internal static class Extensions
 
     public static TimeSpan Sum<T>(this IEnumerable<T> @this, Func<T, TimeSpan> func) =>
         @this.Select(func).Sum();
+
+    public static TimeSpan Average(this IEnumerable<TimeSpan> @this)
+    {
+        var d = @this.Average(x => x.TotalSeconds);
+        return TimeSpan.FromSeconds(d);
+    }
+
+    public static TimeSpan Average<T>(this IEnumerable<T> @this, Func<T, TimeSpan> func) =>
+        @this.Select(func).Average();
 }
