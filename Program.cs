@@ -13,6 +13,7 @@ using Microsoft.TeamFoundation.Build.WebApi;
 using Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models;
 using Microsoft.VisualBasic;
 using Microsoft.VisualStudio.Services.Common;
+using Microsoft.VisualStudio.Services.Graph.Client;
 using Microsoft.VisualStudio.Services.OAuth;
 using Microsoft.VisualStudio.Services.WebApi;
 using Mono.Options;
@@ -22,13 +23,15 @@ const string AzdoProjectName = "public";
 
 try
 {
-    int prNumber = 0;
+    int optionPr = 0;
+    int optionBuild = 0;
     bool detailed = false;
     string? phaseNameFilter = null;
 
     var options = new OptionSet
     {
-        { "pr=", "The PR value (required)", (int v) => prNumber = v },
+        { "pr=", "The PR value (required)", (int v) => optionPr = v },
+        { "build=", "The AzDO build id", (int v) => optionBuild = v },
         { "phase=", "Filter to a phase", (string p) => phaseNameFilter = p },
         { "detailed", "Enable detailed mode", v => detailed = v != null }
     };
@@ -39,15 +42,25 @@ try
         throw new OptionException("Unrecognized option: " + extra[0], extra[0]);
     }
 
-    if (prNumber == 0)
+    string query;
+    if (optionPr == 0 && optionBuild == 0)
     {
-        prNumber = 76828;
-        Console.WriteLine($"No PR number specified, using {prNumber}");
+        optionPr = 76828;
+        Console.WriteLine($"No PR number specified, using {optionPr}");
+        query = GetHelixWorkItemQueryForPullRequest(optionPr);
+    }
+    else if (optionPr != 0)
+    {
+        query = GetHelixWorkItemQueryForPullRequest(optionPr);
+    }
+    else
+    {
+        query = GetHelixWorkItemQueryForBuild(optionBuild);
     }
 
     var credential = new AzureCliCredential(
         new AzureCliCredentialOptions { TenantId = "72f988bf-86f1-41af-91ab-2d7cd011db47" });
-    var allWorkItemResults = await GetAllHelixWorkItemResults(credential, prNumber);
+    var allWorkItemResults = await GetAllHelixWorkItemResults(credential, query);
     var azdoConnection = await GetAzdoConnection(credential);
     var buildClient = azdoConnection.GetClient<BuildHttpClient>();
     var httpClient = new HttpClient();
@@ -89,9 +102,39 @@ IEnumerable<(int AzdoBuildId, List<WorkItemResult>)> GetByBuild(List<WorkItemRes
     }
 }
 
+string GetHelixWorkItemQueryForPullRequest(int prNumber) => $"""
+    Jobs
+    | where Repository == "dotnet/roslyn"
+    | where Branch == "refs/pull/{prNumber}/merge"
+    | project-away Started, Finished
+    | join kind=inner WorkItems on JobId
+    | extend p = parse_json(Properties)
+    | extend AzdoPhaseName = tostring(p["System.PhaseName"])
+    | extend AzdoAttempt = tostring(p["System.JobAttempt"])
+    | extend AzdoBuildId = toint(p["BuildId"])
+    | extend ExecutionTime = (Finished - Started) / 1s
+    | extend QueuedTime = (Started - Queued) / 1s
+    | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt, MachineName
+    """;
+
+string GetHelixWorkItemQueryForBuild(int buildNumber) => $"""
+    Jobs
+    | where Repository == "dotnet/roslyn"
+    | project-away Started, Finished
+    | join kind=inner WorkItems on JobId
+    | extend p = parse_json(Properties)
+    | extend AzdoBuildId = toint(p["BuildId"])
+    | where AzdoBuildId == {buildNumber}
+    | extend AzdoPhaseName = tostring(p["System.PhaseName"])
+    | extend AzdoAttempt = tostring(p["System.JobAttempt"])
+    | extend ExecutionTime = (Finished - Started) / 1s
+    | extend QueuedTime = (Started - Queued) / 1s
+    | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt, MachineName
+    """;
+
 // This will get all of the work item results for a given PR. If there are multiple builds for the PRs
 // then this will return the work item results for all of them
-async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential credential, int prNumber)
+async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential credential, string query)
 {
     try
     {
@@ -107,21 +150,6 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
             .WithAadTokenProviderAuthentication(() => token.Token);
 
         using var kustoQueryClient = KustoClientFactory.CreateCslQueryProvider(kustoConnectionStringBuilder);
-        var query = $"""
-            Jobs
-            | where Repository == "dotnet/roslyn"
-            | where Branch == "refs/pull/{prNumber}/merge"
-            | project-away Started, Finished
-            | join kind=inner WorkItems on JobId
-            | extend  p = parse_json(Properties)
-            | extend AzdoPhaseName = tostring(p["System.PhaseName"])
-            | extend AzdoAttempt = tostring(p["System.JobAttempt"])
-            | extend AzdoBuildId = toint(p["BuildId"])
-            | extend ExecutionTime = (Finished - Started) / 1s
-            | extend QueuedTime = (Started - Queued) / 1s
-            | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt, MachineName
-            """;
-
         var reader = kustoQueryClient.ExecuteQuery(query);
         var list = new List<WorkItemResult>();
 
@@ -172,7 +200,8 @@ async Task PrintBuildDetails(
     var timeline = await buildClient.GetBuildTimelineAsync(AzdoProjectName, azdoBuildId);
     var groupedResults = workItemResults
         .Where(x => x.AzdoPhaseName != phaseNameFilter)
-        .GroupBy(x => x.AzdoPhaseName);
+        .GroupBy(x => x.AzdoPhaseName)
+        .OrderBy(x => x.Key);
 
     foreach (var g in groupedResults)
     {
