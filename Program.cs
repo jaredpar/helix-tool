@@ -1,106 +1,394 @@
-﻿
-using System.Data.SqlTypes;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.IO.Compression;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Azure.Core;
 using Azure.Identity;
-using Kusto.Cloud.Platform.Utils;
 using Kusto.Data;
 using Kusto.Data.Net.Client;
 using Microsoft.TeamFoundation.Build.WebApi;
-using Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models;
-using Microsoft.VisualBasic;
 using Microsoft.VisualStudio.Services.Common;
-using Microsoft.VisualStudio.Services.Graph.Client;
 using Microsoft.VisualStudio.Services.OAuth;
 using Microsoft.VisualStudio.Services.WebApi;
-using Mono.Options;
+using Spectre.Console;
 
-const string AzdoOrganizationUrl = $"https://dev.azure.com/dnceng-public";
+const string AzdoOrganizationUrl = "https://dev.azure.com/dnceng-public";
 const string AzdoProjectName = "public";
+const string BackOption = "<-- Back";
+const string QuitOption = "Quit";
+
+// Authenticate and initialize clients
+AzureCliCredential credential;
+BuildHttpClient buildClient;
+HttpClient httpClient;
 
 try
 {
-    int optionPr = 0;
-    int optionBuild = 0;
-    bool detailed = false;
-    string? phaseNameFilter = null;
-
-    var options = new OptionSet
-    {
-        { "pr=", "The PR value (required)", (int v) => optionPr = v },
-        { "build=", "The AzDO build id", (int v) => optionBuild = v },
-        { "phase=", "Filter to a phase", (string p) => phaseNameFilter = p },
-        { "detailed", "Enable detailed mode", v => detailed = v != null }
-    };
-
-    var extra = options.Parse(args);
-    if (extra.Count > 0)
-    {
-        throw new OptionException("Unrecognized option: " + extra[0], extra[0]);
-    }
-
-    string query;
-    if (optionPr == 0 && optionBuild == 0)
-    {
-        optionPr = 76828;
-        Console.WriteLine($"No PR number specified, using {optionPr}");
-        query = GetHelixWorkItemQueryForPullRequest(optionPr);
-    }
-    else if (optionPr != 0)
-    {
-        query = GetHelixWorkItemQueryForPullRequest(optionPr);
-    }
-    else
-    {
-        query = GetHelixWorkItemQueryForBuild(optionBuild);
-    }
-
-    var credential = new AzureCliCredential(
+    credential = new AzureCliCredential(
         new AzureCliCredentialOptions { TenantId = "72f988bf-86f1-41af-91ab-2d7cd011db47" });
-    var allWorkItemResults = await GetAllHelixWorkItemResults(credential, query);
-    var azdoConnection = await GetAzdoConnection(credential);
-    var buildClient = azdoConnection.GetClient<BuildHttpClient>();
-    var httpClient = new HttpClient();
-    foreach (var (azdoBuildId, workItemResults) in GetByBuild(allWorkItemResults))
+
+    var azdoConnection = await AnsiConsole.Status().StartAsync("Authenticating...", async ctx =>
     {
-        try
-        {
-            PrintBuildDetails(buildClient, httpClient, azdoBuildId, workItemResults, phaseNameFilter, detailed).Wait();
-        }
-        catch (Exception ex)
-        {
-            Console.Write(ex.Message);
-            Console.Write(ex.StackTrace);
-        }
-    }
+        return await GetAzdoConnection(credential);
+    });
+
+    buildClient = azdoConnection.GetClient<BuildHttpClient>();
+    httpClient = new HttpClient();
 }
 catch (Exception ex)
 {
-    Console.WriteLine(ex.Message);
-    Console.WriteLine(ex.StackTrace);
+    AnsiConsole.MarkupLine("[red bold]Authentication failed.[/]");
+    AnsiConsole.MarkupLine("[yellow]Are you logged in? Run: az login[/]");
+    AnsiConsole.MarkupLine($"[dim]{Markup.Escape(ex.Message)}[/]");
+    return;
 }
 
-IEnumerable<(int AzdoBuildId, List<WorkItemResult>)> GetByBuild(List<WorkItemResult> workItemResults)
+// TUI state
+var currentScreen = Screen.BuildList;
+List<BuildSummary>? builds = null;
+BuildSummary? selectedBuild = null;
+List<WorkItemResult>? buildWorkItems = null;
+List<PhaseSummary>? phaseSummaries = null;
+PhaseSummary? selectedPhase = null;
+List<WorkItemResult>? phaseWorkItems = null;
+WorkItemResult? selectedWorkItem = null;
+
+while (currentScreen != Screen.Exit)
 {
-    var buildIds = workItemResults
-        .Select(x => x.AzdoBuildId)
-        .Distinct()
-        .OrderByDescending(x => x)
-        .ToList();
-    if (buildIds.Count == 1)
+    switch (currentScreen)
     {
-        yield return (buildIds[0], workItemResults);
-        yield break;
-    }
+        case Screen.BuildList:
+        {
+            AnsiConsole.Clear();
+            AnsiConsole.Write(new Rule("[bold blue]Helix Build Explorer - dotnet/roslyn[/]").LeftJustified());
+            AnsiConsole.WriteLine();
 
-    foreach (var buildId in buildIds)
-    {
-        yield return (buildId, workItemResults.Where(x => x.AzdoBuildId == buildId).ToList());
+            if (builds is null)
+            {
+                try
+                {
+                    builds = await AnsiConsole.Status().StartAsync("Fetching recent builds...", async ctx =>
+                    {
+                        return await GetRecentBuilds(buildClient);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine("[red]Failed to fetch builds.[/]");
+                    AnsiConsole.MarkupLine($"[dim]{Markup.Escape(ex.Message)}[/]");
+                    AnsiConsole.MarkupLine("Press any key to retry...");
+                    Console.ReadKey(true);
+                    continue;
+                }
+            }
+
+            if (builds.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No recent builds found.[/]");
+                AnsiConsole.MarkupLine("Press any key to exit...");
+                Console.ReadKey(true);
+                currentScreen = Screen.Exit;
+                break;
+            }
+
+            var buildChoices = builds.Select(b => b.ToDisplayString()).ToList();
+            buildChoices.Add(QuitOption);
+
+            var selected = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("Select a build:")
+                    .PageSize(25)
+                    .HighlightStyle(new Style(Color.Yellow))
+                    .AddChoices(buildChoices));
+
+            if (selected == QuitOption)
+            {
+                currentScreen = Screen.Exit;
+            }
+            else
+            {
+                selectedBuild = builds.First(b => b.ToDisplayString() == selected);
+                buildWorkItems = null;
+                phaseSummaries = null;
+                currentScreen = Screen.PhaseList;
+            }
+            break;
+        }
+
+        case Screen.PhaseList:
+        {
+            Debug.Assert(selectedBuild is not null);
+            AnsiConsole.Clear();
+            AnsiConsole.Write(new Rule($"[bold blue]Build {selectedBuild.BuildId} - {Markup.Escape(selectedBuild.BranchDisplay)}[/]").LeftJustified());
+            AnsiConsole.WriteLine();
+
+            // Fetch work items if not already loaded
+            if (buildWorkItems is null)
+            {
+                try
+                {
+                    var query = GetHelixWorkItemQueryForBuild(selectedBuild.BuildId);
+                    buildWorkItems = await AnsiConsole.Status().StartAsync("Querying Helix data...", async ctx =>
+                    {
+                        return await GetAllHelixWorkItemResults(credential, query);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine("[red]Failed to fetch Helix data.[/]");
+                    AnsiConsole.MarkupLine("[yellow]Are you connected to the VPN?[/]");
+                    AnsiConsole.MarkupLine($"[dim]{Markup.Escape(ex.Message)}[/]");
+                    AnsiConsole.MarkupLine("Press any key to go back...");
+                    Console.ReadKey(true);
+                    currentScreen = Screen.BuildList;
+                    break;
+                }
+            }
+
+            if (buildWorkItems.Count == 0)
+            {
+                AnsiConsole.MarkupLine("[yellow]No Helix work items found for this build.[/]");
+                AnsiConsole.MarkupLine("Press any key to go back...");
+                Console.ReadKey(true);
+                currentScreen = Screen.BuildList;
+                break;
+            }
+
+            // Build phase summaries if not cached
+            if (phaseSummaries is null)
+            {
+                try
+                {
+                    phaseSummaries = await AnsiConsole.Status().StartAsync("Loading phase details...", async ctx =>
+                    {
+                        return await BuildPhaseSummaries(buildClient, httpClient, selectedBuild.BuildId, buildWorkItems);
+                    });
+                }
+                catch (Exception ex)
+                {
+                    AnsiConsole.MarkupLine("[red]Failed to load phase details.[/]");
+                    AnsiConsole.MarkupLine($"[dim]{Markup.Escape(ex.Message)}[/]");
+                    AnsiConsole.MarkupLine("Press any key to go back...");
+                    Console.ReadKey(true);
+                    currentScreen = Screen.BuildList;
+                    break;
+                }
+            }
+
+            // Display summary table
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .AddColumn(new TableColumn("Phase").Width(44))
+                .AddColumn(new TableColumn("AzDo").RightAligned())
+                .AddColumn(new TableColumn("AzDo Est").RightAligned())
+                .AddColumn(new TableColumn("Helix Que").RightAligned())
+                .AddColumn(new TableColumn("Que Avg").RightAligned())
+                .AddColumn(new TableColumn("Helix Exec").RightAligned())
+                .AddColumn(new TableColumn("Items").RightAligned())
+                .AddColumn(new TableColumn("Machines").RightAligned());
+
+            foreach (var ps in phaseSummaries)
+            {
+                table.AddRow(
+                    Markup.Escape(ps.PhaseName),
+                    FormatTimeSpan(ps.AzdoExecutionTime),
+                    FormatTimeSpan(ps.EstimatedTime),
+                    ps.TotalQueuedTime.ToString(@"hh\:mm\:ss"),
+                    ps.AverageQueuedTime.ToString(@"hh\:mm\:ss"),
+                    ps.TotalExecutionTime.ToString(@"hh\:mm\:ss"),
+                    ps.WorkItemCount.ToString(),
+                    ps.MachineCount.ToString());
+            }
+            AnsiConsole.Write(table);
+            AnsiConsole.WriteLine();
+
+            // Phase selection prompt
+            var phaseChoices = new List<string> { BackOption };
+            phaseChoices.AddRange(phaseSummaries.Select(p => p.PhaseName));
+
+            var selected = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("Select a phase:")
+                    .PageSize(25)
+                    .HighlightStyle(new Style(Color.Yellow))
+                    .AddChoices(phaseChoices));
+
+            if (selected == BackOption)
+            {
+                currentScreen = Screen.BuildList;
+            }
+            else
+            {
+                selectedPhase = phaseSummaries.First(p => p.PhaseName == selected);
+                phaseWorkItems = buildWorkItems
+                    .Where(x => x.AzdoPhaseName == selectedPhase.PhaseName && x.AzdoAttempt == selectedPhase.AttemptId)
+                    .OrderBy(x => x.MachineName)
+                    .ThenBy(x => x.FriendlyName)
+                    .ToList();
+                currentScreen = Screen.WorkItemList;
+            }
+            break;
+        }
+
+        case Screen.WorkItemList:
+        {
+            Debug.Assert(selectedBuild is not null);
+            Debug.Assert(selectedPhase is not null);
+            Debug.Assert(phaseWorkItems is not null);
+
+            AnsiConsole.Clear();
+            AnsiConsole.Write(new Rule($"[bold blue]{Markup.Escape(selectedPhase.PhaseName)}[/] [dim](Build {selectedBuild.BuildId}, Attempt {selectedPhase.AttemptId})[/]").LeftJustified());
+            AnsiConsole.WriteLine();
+
+            // Display work items table
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .AddColumn(new TableColumn("Work Item").Width(20))
+                .AddColumn(new TableColumn("Queued").RightAligned())
+                .AddColumn(new TableColumn("Execution").RightAligned())
+                .AddColumn(new TableColumn("Machine"));
+
+            foreach (var wi in phaseWorkItems)
+            {
+                table.AddRow(
+                    Markup.Escape(wi.FriendlyName),
+                    wi.QueuedTime.ToString(@"hh\:mm\:ss"),
+                    wi.ExecutionTime.ToString(@"hh\:mm\:ss"),
+                    Markup.Escape(wi.MachineName));
+            }
+            AnsiConsole.Write(table);
+            AnsiConsole.WriteLine();
+
+            // Work item selection prompt
+            var wiChoices = new List<string> { BackOption };
+            wiChoices.AddRange(phaseWorkItems.Select(wi =>
+                $"{wi.FriendlyName} ({wi.ExecutionTime:hh\\:mm\\:ss} on {wi.MachineName})"));
+
+            var selected = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("Select a work item for details:")
+                    .PageSize(25)
+                    .HighlightStyle(new Style(Color.Yellow))
+                    .AddChoices(wiChoices));
+
+            if (selected == BackOption)
+            {
+                currentScreen = Screen.PhaseList;
+            }
+            else
+            {
+                var index = wiChoices.IndexOf(selected) - 1; // -1 for BackOption
+                selectedWorkItem = phaseWorkItems[index];
+                currentScreen = Screen.WorkItemDetail;
+            }
+            break;
+        }
+
+        case Screen.WorkItemDetail:
+        {
+            Debug.Assert(selectedBuild is not null);
+            Debug.Assert(selectedPhase is not null);
+            Debug.Assert(selectedWorkItem is not null);
+
+            AnsiConsole.Clear();
+            AnsiConsole.Write(new Rule($"[bold blue]{Markup.Escape(selectedWorkItem.FriendlyName)}[/]").LeftJustified());
+            AnsiConsole.WriteLine();
+
+            var buildUrl = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={selectedBuild.BuildId}";
+
+            var table = new Table()
+                .Border(TableBorder.Rounded)
+                .HideHeaders()
+                .AddColumn(new TableColumn("Field").Width(20))
+                .AddColumn(new TableColumn("Value"));
+
+            table.AddRow("[bold]Friendly Name[/]", Markup.Escape(selectedWorkItem.FriendlyName));
+            table.AddRow("[bold]Build ID[/]", selectedBuild.BuildId.ToString());
+            table.AddRow("[bold]Phase[/]", Markup.Escape(selectedWorkItem.AzdoPhaseName));
+            table.AddRow("[bold]Attempt[/]", selectedWorkItem.AzdoAttempt.ToString());
+            table.AddRow("[bold]Machine[/]", Markup.Escape(selectedWorkItem.MachineName));
+            table.AddRow("[bold]Queued Time[/]", selectedWorkItem.QueuedTime.ToString(@"hh\:mm\:ss"));
+            table.AddRow("[bold]Execution Time[/]", selectedWorkItem.ExecutionTime.ToString(@"hh\:mm\:ss"));
+            table.AddRow("[bold]AzDO Build[/]", Markup.Escape(buildUrl));
+
+            AnsiConsole.Write(table);
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[dim]Press any key to go back...[/]");
+            Console.ReadKey(true);
+            currentScreen = Screen.WorkItemList;
+            break;
+        }
     }
 }
+
+// --- Data fetching functions ---
+
+async Task<List<BuildSummary>> GetRecentBuilds(BuildHttpClient client, int count = 20)
+{
+    var builds = await client.GetBuildsAsync(
+        project: AzdoProjectName,
+        repositoryId: "dotnet/roslyn",
+        repositoryType: "GitHub",
+        queryOrder: BuildQueryOrder.StartTimeDescending,
+        top: count);
+
+    return builds.Select(b => new BuildSummary(
+        BuildId: b.Id,
+        BuildNumber: b.BuildNumber ?? "",
+        SourceBranch: b.SourceBranch ?? "",
+        RequestedBy: b.RequestedBy?.DisplayName ?? "Unknown",
+        Result: b.Result,
+        Status: b.Status,
+        StartTime: b.StartTime,
+        FinishTime: b.FinishTime
+    )).ToList();
+}
+
+async Task<List<PhaseSummary>> BuildPhaseSummaries(
+    BuildHttpClient client,
+    HttpClient http,
+    int buildId,
+    List<WorkItemResult> workItems)
+{
+    var timeline = await client.GetBuildTimelineAsync(AzdoProjectName, buildId);
+    var buildArtifacts = await client.GetArtifactsAsync(AzdoProjectName, buildId);
+    var summaries = new List<PhaseSummary>();
+
+    foreach (var g in workItems.GroupBy(x => x.AzdoPhaseName).OrderBy(x => x.Key))
+    {
+        var attemptId = g.Max(x => x.AzdoAttempt);
+        var phaseItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
+        var azdoExecTime = GetAzdoPhaseExecutionTime(timeline, g.Key);
+
+        TimeSpan? estimatedTime = null;
+        try
+        {
+            var azdoData = await GetAzdoWorkItemData(http, buildId, g.Key, attemptId, buildArtifacts);
+            estimatedTime = azdoData.Sum(x => x.ExpectedExecutionTime);
+        }
+        catch
+        {
+            // Artifact may not be available
+        }
+
+        summaries.Add(new PhaseSummary(
+            PhaseName: g.Key,
+            AttemptId: attemptId,
+            WorkItemCount: phaseItems.Count,
+            MachineCount: phaseItems.Select(x => x.MachineName).Distinct().Count(),
+            TotalExecutionTime: phaseItems.Sum(x => x.ExecutionTime),
+            TotalQueuedTime: phaseItems.Sum(x => x.QueuedTime),
+            AverageQueuedTime: phaseItems.Average(x => x.QueuedTime),
+            AzdoExecutionTime: azdoExecTime,
+            EstimatedTime: estimatedTime));
+    }
+    return summaries;
+}
+
+string FormatTimeSpan(TimeSpan? ts) =>
+    ts.HasValue ? ts.Value.ToString(@"hh\:mm\:ss") : "N/A";
+
+// --- Kusto query builders ---
 
 string GetHelixWorkItemQueryForPullRequest(int prNumber) => $"""
     Jobs
@@ -132,20 +420,18 @@ string GetHelixWorkItemQueryForBuild(int buildNumber) => $"""
     | project FriendlyName, ExecutionTime, QueuedTime, AzdoBuildId, AzdoPhaseName, AzdoAttempt, MachineName
     """;
 
-// This will get all of the work item results for a given PR. If there are multiple builds for the PRs
-// then this will return the work item results for all of them
-async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential credential, string query)
+// --- Kusto data fetching ---
+
+async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred, string query)
 {
     try
     {
-        // Replace with your cluster URI and database name
         var clusterUrl = "https://engsrvprod.kusto.windows.net";
         var databaseName = "engineeringdata";
 
         var tokenRequestContext = new TokenRequestContext(["https://kusto.kusto.windows.net/.default"]);
-        var token = await credential.GetTokenAsync(tokenRequestContext, default);
+        var token = await cred.GetTokenAsync(tokenRequestContext, default);
 
-        // Create a Kusto connection string
         var kustoConnectionStringBuilder = new KustoConnectionStringBuilder(clusterUrl, databaseName)
             .WithAadTokenProviderAuthentication(() => token.Token);
 
@@ -153,7 +439,6 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
         var reader = kustoQueryClient.ExecuteQuery(query);
         var list = new List<WorkItemResult>();
 
-        // Read and print results
         while (reader.Read())
         {
             var friendlyName = reader.GetString(0);
@@ -176,94 +461,18 @@ async Task<List<WorkItemResult>> GetAllHelixWorkItemResults(TokenCredential cred
     }
     catch (Exception ex)
     {
-        Console.WriteLine(ex.Message);
-        Console.WriteLine("Error reading Kusto, are you connected to the VPN?");
+        AnsiConsole.MarkupLine($"[dim]{Markup.Escape(ex.Message)}[/]");
+        AnsiConsole.MarkupLine("[yellow]Error reading Kusto, are you connected to the VPN?[/]");
         throw;
     }
 }
 
-async Task PrintBuildDetails(
-    BuildHttpClient buildClient,
-    HttpClient httpClient,
-    int azdoBuildId,
-    List<WorkItemResult> workItemResults,
-    string? phaseNameFilter,
-    bool detailed)
+// --- AzDO helper functions ---
+
+async Task<VssConnection> GetAzdoConnection(TokenCredential cred)
 {
-    var url = $"{AzdoOrganizationUrl}/{AzdoProjectName}/_build/results?buildId={azdoBuildId}";
-    Console.WriteLine(url);
-    Console.WriteLine();
-    Console.WriteLine("|Phase                                      | AzDo     | AzDo Est | Helix Que | Helix QueAvg |Helix Exec | Helix Items | Helix Machines |");
-    Console.WriteLine("|-------------------------------------------|----------|----------|-----------|--------------|-----------|-------------|----------------|");
-
-    var buildArtifacts = await buildClient.GetArtifactsAsync(AzdoProjectName, azdoBuildId);
-    var timeline = await buildClient.GetBuildTimelineAsync(AzdoProjectName, azdoBuildId);
-    var groupedResults = workItemResults
-        .Where(x => x.AzdoPhaseName != phaseNameFilter)
-        .GroupBy(x => x.AzdoPhaseName)
-        .OrderBy(x => x.Key);
-
-    foreach (var g in groupedResults)
-    {
-        var attemptId = g.Max(x => x.AzdoAttempt);
-        var phaseWorkItems = g.Where(x => x.AzdoAttempt == attemptId).ToList();
-        await PrintBuildPhaseDetails(
-            httpClient,
-            azdoBuildId,
-            g.Key,
-            attemptId,
-            g.ToList(),
-            buildArtifacts,
-            timeline);
-    }
-
-    Console.WriteLine();
-
-    if (detailed)
-    {
-        foreach (var g in groupedResults)
-        {
-            Console.WriteLine(g.Key);
-            Console.WriteLine();
-            Console.WriteLine("| Work Item Name | Queued   | Execution | Machine    |");
-            Console.WriteLine("|----------------|----------|-----------|------------|");
-            foreach (var item in g.OrderBy(x => x.MachineName))
-            {
-                Console.WriteLine($"| {item.FriendlyName,-15}| {item.QueuedTime:hh\\:mm\\:ss} | {item.ExecutionTime:hh\\:mm\\:ss}  | {item.MachineName,-11}|");
-            }
-            Console.WriteLine();
-        }
-    }
-
-    async Task PrintBuildPhaseDetails(
-        HttpClient httpClient,
-        int buildId,
-        string phaseName,
-        int attemptId,
-        List<WorkItemResult> helixResults,
-        List<BuildArtifact> buildArtifacts,
-        Timeline timeline)
-    {
-        Debug.Assert(helixResults.All(x => x.AzdoPhaseName == phaseName));
-        var azdoDataList = await GetAzdoWorkItemData(
-            httpClient,
-            buildId,
-            phaseName,
-            attemptId,
-            buildArtifacts);
-
-        var azdoExecutionTime = GetAzdoPhaseExecutionTime(timeline, phaseName);
-        var estimatedTime = azdoDataList.Sum(x => x.ExpectedExecutionTime);
-        Console.Write($"| {phaseName,-42}|");
-        Console.Write($" {azdoExecutionTime:hh\\:mm\\:ss} |");
-        Console.Write($" {estimatedTime:hh\\:mm\\:ss} |");
-        Console.Write($" {helixResults.Sum(x => x.QueuedTime):hh\\:mm\\:ss}  |");
-        Console.Write($" {helixResults.Average(x => x.QueuedTime):hh\\:mm\\:ss}     |");
-        Console.Write($" {helixResults.Sum(x => x.ExecutionTime):hh\\:mm\\:ss}  |");
-        Console.Write($" {helixResults.Count,-12}|");
-        Console.Write($" {helixResults.Select(x => x.MachineName).Distinct().Count(),-15}|");
-        Console.WriteLine();
-    }        
+    var accessToken = await cred.GetTokenAsync(new TokenRequestContext(["499b84ac-1321-427f-aa17-267ca6975798/.default"]), cancellationToken: default);
+    return new VssConnection(new Uri(AzdoOrganizationUrl), new VssOAuthAccessTokenCredential(accessToken.Token));
 }
 
 TimeSpan? GetAzdoPhaseExecutionTime(
@@ -275,7 +484,7 @@ TimeSpan? GetAzdoPhaseExecutionTime(
         return null;
     }
 
-    var record = timeline.Records.Where(x => x.Name ==  phaseName && x.RecordType == "Phase").FirstOrDefault();;
+    var record = timeline.Records.Where(x => x.Name == phaseName && x.RecordType == "Phase").FirstOrDefault();
     if (record is null)
     {
         return null;
@@ -284,14 +493,8 @@ TimeSpan? GetAzdoPhaseExecutionTime(
     return record.FinishTime - record.StartTime;
 }
 
-async Task<VssConnection> GetAzdoConnection(TokenCredential credential)
-{
-    var accessToken = await credential.GetTokenAsync(new Azure.Core.TokenRequestContext(["499b84ac-1321-427f-aa17-267ca6975798/.default"]), cancellationToken: default);
-    return new VssConnection(new Uri(AzdoOrganizationUrl), new VssOAuthAccessTokenCredential(accessToken.Token));
-}
-
 async Task<List<WorkItemData>> GetAzdoWorkItemData(
-    HttpClient httpClient,
+    HttpClient http,
     int buildId,
     string phaseName,
     int attemptId,
@@ -299,7 +502,7 @@ async Task<List<WorkItemData>> GetAzdoWorkItemData(
 {
     var name = $"{phaseName} Attempt {attemptId} Logs";
     var artifact = buildArtifacts.FirstOrDefault(x => x.Name == name)!;
-    using var stream = await httpClient.GetStreamAsync(artifact.Resource.DownloadUrl);
+    using var stream = await http.GetStreamAsync(artifact.Resource.DownloadUrl);
     using var zip = new ZipArchive(stream, ZipArchiveMode.Read);
     var helixEntry = zip.Entries.Single(x => x.Name == "helix.proj");
     using var reader = new StreamReader(helixEntry.Open());
@@ -308,7 +511,7 @@ async Task<List<WorkItemData>> GetAzdoWorkItemData(
     var document = XDocument.Parse(xmlContent);
     return document
         .Descendants("HelixWorkItem")
-        .Select(e => 
+        .Select(e =>
         {
             var expectedStr = e.Element("ExpectedExecutionTime")?.Value;
             if (string.IsNullOrEmpty(expectedStr))
@@ -320,6 +523,45 @@ async Task<List<WorkItemData>> GetAzdoWorkItemData(
         })
         .ToList();
 }
+
+// --- Data models ---
+
+enum Screen { BuildList, PhaseList, WorkItemList, WorkItemDetail, Exit }
+
+internal sealed record BuildSummary(
+    int BuildId,
+    string BuildNumber,
+    string SourceBranch,
+    string RequestedBy,
+    BuildResult? Result,
+    BuildStatus? Status,
+    DateTime? StartTime,
+    DateTime? FinishTime)
+{
+    public string BranchDisplay =>
+        SourceBranch
+            .Replace("refs/heads/", "")
+            .Replace("refs/pull/", "PR ")
+            .Replace("/merge", "");
+
+    public string ToDisplayString()
+    {
+        var status = Result?.ToString() ?? Status?.ToString() ?? "Unknown";
+        var time = StartTime?.ToString("yyyy-MM-dd HH:mm") ?? "?";
+        return $"{BuildId} | {BranchDisplay,-30} | {status,-12} | {time} | {RequestedBy}";
+    }
+}
+
+internal sealed record PhaseSummary(
+    string PhaseName,
+    int AttemptId,
+    int WorkItemCount,
+    int MachineCount,
+    TimeSpan TotalExecutionTime,
+    TimeSpan TotalQueuedTime,
+    TimeSpan AverageQueuedTime,
+    TimeSpan? AzdoExecutionTime,
+    TimeSpan? EstimatedTime);
 
 internal sealed class WorkItemData(string name, TimeSpan expectedExecutionTime)
 {
@@ -348,6 +590,8 @@ internal sealed class WorkItemResult(
 
     public override string ToString() => $"{FriendlyName} ({AzdoBuildId})";
 }
+
+// --- Extension methods ---
 
 internal static class Extensions
 {
