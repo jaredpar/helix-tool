@@ -7,15 +7,14 @@ using Azure.Identity;
 using Kusto.Data;
 using Kusto.Data.Net.Client;
 using Microsoft.TeamFoundation.Build.WebApi;
-using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.OAuth;
 using Microsoft.VisualStudio.Services.WebApi;
 using Spectre.Console;
 
 const string AzdoOrganizationUrl = "https://dev.azure.com/dnceng-public";
 const string AzdoProjectName = "public";
-const string BackOption = "<-- Back";
-const string QuitOption = "Quit";
+const string EscHint = "[dim](Esc to go back)[/]";
+const string EscHintQuit = "[dim](Esc to quit)[/]";
 
 // Authenticate and initialize clients
 AzureCliCredential credential;
@@ -92,22 +91,15 @@ while (currentScreen != Screen.Exit)
             }
 
             var buildChoices = builds.Select(b => b.ToDisplayString()).ToList();
-            buildChoices.Add(QuitOption);
+            var selectedIndex = RunSelection($"{EscHintQuit} Select a build:", buildChoices);
 
-            var selected = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("Select a build:")
-                    .PageSize(25)
-                    .HighlightStyle(new Style(Color.Yellow))
-                    .AddChoices(buildChoices));
-
-            if (selected == QuitOption)
+            if (selectedIndex < 0)
             {
                 currentScreen = Screen.Exit;
             }
             else
             {
-                selectedBuild = builds.First(b => b.ToDisplayString() == selected);
+                selectedBuild = builds[selectedIndex];
                 buildWorkItems = null;
                 phaseSummaries = null;
                 currentScreen = Screen.PhaseList;
@@ -203,23 +195,16 @@ while (currentScreen != Screen.Exit)
             AnsiConsole.WriteLine();
 
             // Phase selection prompt
-            var phaseChoices = new List<string> { BackOption };
-            phaseChoices.AddRange(phaseSummaries.Select(p => p.PhaseName));
+            var phaseChoices = phaseSummaries.Select(p => p.PhaseName).ToList();
+            var selectedIndex = RunSelection($"{EscHint} Select a phase:", phaseChoices);
 
-            var selected = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("Select a phase:")
-                    .PageSize(25)
-                    .HighlightStyle(new Style(Color.Yellow))
-                    .AddChoices(phaseChoices));
-
-            if (selected == BackOption)
+            if (selectedIndex < 0)
             {
                 currentScreen = Screen.BuildList;
             }
             else
             {
-                selectedPhase = phaseSummaries.First(p => p.PhaseName == selected);
+                selectedPhase = phaseSummaries[selectedIndex];
                 phaseWorkItems = buildWorkItems
                     .Where(x => x.AzdoPhaseName == selectedPhase.PhaseName && x.AzdoAttempt == selectedPhase.AttemptId)
                     .OrderBy(x => x.MachineName)
@@ -260,25 +245,18 @@ while (currentScreen != Screen.Exit)
             AnsiConsole.WriteLine();
 
             // Work item selection prompt
-            var wiChoices = new List<string> { BackOption };
-            wiChoices.AddRange(phaseWorkItems.Select(wi =>
-                $"{wi.FriendlyName} ({wi.ExecutionTime:hh\\:mm\\:ss} on {wi.MachineName})"));
+            var wiChoices = phaseWorkItems.Select(wi =>
+                $"{wi.FriendlyName} ({wi.ExecutionTime:hh\\:mm\\:ss} on {wi.MachineName})").ToList();
 
-            var selected = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("Select a work item for details:")
-                    .PageSize(25)
-                    .HighlightStyle(new Style(Color.Yellow))
-                    .AddChoices(wiChoices));
+            var selectedIndex = RunSelection($"{EscHint} Select a work item:", wiChoices);
 
-            if (selected == BackOption)
+            if (selectedIndex < 0)
             {
                 currentScreen = Screen.PhaseList;
             }
             else
             {
-                var index = wiChoices.IndexOf(selected) - 1; // -1 for BackOption
-                selectedWorkItem = phaseWorkItems[index];
+                selectedWorkItem = phaseWorkItems[selectedIndex];
                 currentScreen = Screen.WorkItemDetail;
             }
             break;
@@ -313,7 +291,7 @@ while (currentScreen != Screen.Exit)
 
             AnsiConsole.Write(table);
             AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[dim]Press any key to go back...[/]");
+            AnsiConsole.MarkupLine("[dim]Press Esc or any key to go back...[/]");
             Console.ReadKey(true);
             currentScreen = Screen.WorkItemList;
             break;
@@ -387,6 +365,103 @@ async Task<List<PhaseSummary>> BuildPhaseSummaries(
 
 string FormatTimeSpan(TimeSpan? ts) =>
     ts.HasValue ? ts.Value.ToString(@"hh\:mm\:ss") : "N/A";
+
+/// Returns selected index, or -1 if Escape was pressed.
+int RunSelection(string title, List<string> choices, int pageSize = 20)
+{
+    AnsiConsole.MarkupLine(title);
+
+    int selected = 0;
+    int scrollOffset = 0;
+    int visible = Math.Min(pageSize, choices.Count);
+    int startRow = Console.CursorTop;
+
+    int width;
+    try { width = Console.WindowWidth; } catch { width = 120; }
+    if (width <= 0) width = 120;
+
+    Console.CursorVisible = false;
+    try
+    {
+        Render();
+        while (true)
+        {
+            var key = Console.ReadKey(true);
+            switch (key.Key)
+            {
+                case ConsoleKey.UpArrow:
+                    if (selected > 0)
+                    {
+                        selected--;
+                        if (selected < scrollOffset)
+                            scrollOffset = selected;
+                        Render();
+                    }
+                    break;
+                case ConsoleKey.DownArrow:
+                    if (selected < choices.Count - 1)
+                    {
+                        selected++;
+                        if (selected >= scrollOffset + visible)
+                            scrollOffset = selected - visible + 1;
+                        Render();
+                    }
+                    break;
+                case ConsoleKey.Enter:
+                    return selected;
+                case ConsoleKey.Escape:
+                    return -1;
+            }
+        }
+    }
+    finally
+    {
+        Console.CursorVisible = true;
+    }
+
+    void Render()
+    {
+        for (int i = 0; i < visible; i++)
+        {
+            Console.SetCursorPosition(0, startRow + i);
+            int idx = scrollOffset + i;
+            if (idx >= choices.Count)
+            {
+                Console.Write(new string(' ', width - 1));
+                continue;
+            }
+
+            string prefix = idx == selected ? "> " : "  ";
+            string text = $"{prefix}{choices[idx]}";
+            if (text.Length < width - 1)
+                text = text.PadRight(width - 1);
+            else
+                text = text[..(width - 1)];
+
+            if (idx == selected)
+            {
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.Write(text);
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.Write(text);
+            }
+        }
+
+        if (choices.Count > visible)
+        {
+            Console.SetCursorPosition(0, startRow + visible);
+            string info = $"  [{scrollOffset + 1}-{Math.Min(scrollOffset + visible, choices.Count)} of {choices.Count}]";
+            if (info.Length < width - 1)
+                info = info.PadRight(width - 1);
+            else
+                info = info[..(width - 1)];
+            Console.Write(info);
+        }
+    }
+}
 
 // --- Kusto query builders ---
 
