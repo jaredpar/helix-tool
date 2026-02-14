@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/helix-cli/helix-cli.csproj" />
+  <Project Path="src/helix-mcp/helix-mcp.csproj" />
+</Solution>

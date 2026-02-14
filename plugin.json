@@ -1,0 +1,14 @@
+{
+  "name": "helix-server",
+  "description": "Information about helix and azdo jobs",
+  "author": {
+    "name": "Jared Parsons"
+  },
+  "mcpServers": {
+    "helix": {
+      "command": "dotnet",
+      "args": ["run", "--project", "./src/helix-mcp/helix-mcp.csproj"],
+      "tools": ["*"]
+    }
+  }
+}
