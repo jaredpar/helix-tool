@@ -9,7 +9,7 @@ using Microsoft.TeamFoundation.Build.WebApi;
 using Microsoft.VisualStudio.Services.OAuth;
 using Microsoft.VisualStudio.Services.WebApi;
 
-namespace HelixCli;
+namespace HelixUtil;
 
 public class HelixService
 {
@@ -101,21 +101,18 @@ public class HelixService
         return new VssConnection(new Uri(AzdoOrganizationUrl), new VssOAuthAccessTokenCredential(accessToken.Token));
     }
 
-    public async Task<List<Build>> GetFailedBuilds(string? definition = null)
+    public async Task<List<Build>> GetFailedBuilds(int? definitionId = null)
     {
         var connection = await GetAzdoConnection();
         var buildClient = connection.GetClient<BuildHttpClient>();
+        var definitions = definitionId is not null ? new[] { definitionId.Value } : null;
         var builds = await buildClient.GetBuildsAsync(
             AzdoProjectName,
+            definitions: definitions,
             statusFilter: BuildStatus.Completed,
             resultFilter: BuildResult.Failed,
             queryOrder: BuildQueryOrder.FinishTimeDescending,
             top: 20);
-
-        if (definition is not null)
-        {
-            builds = builds.Where(b => b.Definition.Name.Contains(definition, StringComparison.OrdinalIgnoreCase)).ToList();
-        }
 
         return builds;
     }

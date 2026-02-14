@@ -1,4 +1,4 @@
-namespace HelixCli;
+namespace HelixUtil;
 
 public sealed class WorkItemResult(
     string friendlyName,

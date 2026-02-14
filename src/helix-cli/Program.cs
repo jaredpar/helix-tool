@@ -1,13 +1,13 @@
 using System.CommandLine;
-using HelixCli;
+using HelixUtil;
 
 var rootCommand = new RootCommand("Helix Tool - Navigate AzDO and Helix pipelines");
 
 // failed-builds
 var failedBuildsCommand = new Command("failed-builds", "List recently failed builds");
-var definitionOption = new Option<string?>("--definition", "Filter by build definition name");
+var definitionOption = new Option<int?>("--definition", "Filter by build definition id");
 failedBuildsCommand.AddOption(definitionOption);
-failedBuildsCommand.SetHandler(async (string? definition) =>
+failedBuildsCommand.SetHandler(async (int? definition) =>
 {
     var credential = HelixService.CreateCredential();
     var service = new HelixService(credential);

@@ -1,6 +1,6 @@
 using System.ComponentModel;
 using System.Text;
-using HelixCli;
+using HelixUtil;
 using ModelContextProtocol.Server;
 
 namespace HelixMcp;
@@ -8,9 +8,9 @@ namespace HelixMcp;
 [McpServerToolType]
 public static class HelixTools
 {
-    [McpServerTool, Description("List recently failed AzDO builds, optionally filtered by definition name")]
+    [McpServerTool, Description("List recently failed AzDO builds, optionally filtered by definition id")]
     public static async Task<string> ListFailedBuilds(
-        [Description("Optional build definition name filter")] string? definition = null)
+        [Description("Optional build definition id filter")] int? definition = null)
     {
         var credential = HelixService.CreateCredential();
         var service = new HelixService(credential);

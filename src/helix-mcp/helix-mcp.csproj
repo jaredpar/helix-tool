@@ -14,7 +14,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\helix-cli\helix-cli.csproj" />
+    <ProjectReference Include="..\helix-util\helix-util.csproj" />
   </ItemGroup>
 
 </Project>
